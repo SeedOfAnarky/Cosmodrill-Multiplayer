@@ -14,9 +14,10 @@ internal sealed class ReplicationChannel
     private TcpListener listener;
     private TcpClient client;
     private volatile bool running;
+    private volatile bool clientConnected;
     private int nextPeer;
 
-    internal bool IsConnected => listener != null ? !peers.IsEmpty : client != null;
+    internal bool IsConnected => listener != null ? !peers.IsEmpty : clientConnected;
     internal ReplicationChannel(Action<int, string> onLine, Action<int> onDisconnected, Action<string> log) { this.onLine = onLine; this.onDisconnected = onDisconnected; this.log = log; }
 
     internal void StartServer(int port)
@@ -33,9 +34,9 @@ internal sealed class ReplicationChannel
         {
             while (running)
             {
-                try { client = new TcpClient(); client.NoDelay = true; client.Connect(address, port); log("State client connected to " + address + ":" + port); ReadLoop(client, -1); }
+                try { client = new TcpClient(); client.NoDelay = true; client.Connect(address, port); clientConnected = true; log("State client connected to " + address + ":" + port); ReadLoop(client, -1); }
                 catch (Exception ex) { if (running) log("State client retry: " + ex.Message); }
-                finally { try { client?.Close(); } catch { } client = null; }
+                finally { clientConnected = false; try { client?.Close(); } catch { } client = null; }
                 if (running) Thread.Sleep(1500);
             }
         }) { IsBackground = true, Name = "CosmodrillReplicationClient" }; thread.Start();
@@ -75,15 +76,36 @@ internal sealed class ReplicationChannel
         return sent;
     }
 
+    internal bool SendTo(int peerId, string line)
+    {
+        if (listener == null || line == null || line.Length > 2048) return false;
+        TcpClient peer;
+        if (!peers.TryGetValue(peerId, out peer)) return false;
+        return Write(peer, Encoding.UTF8.GetBytes(line + "\n"), peerId);
+    }
+
+    internal void DisconnectPeer(int peerId)
+    {
+        TcpClient peer;
+        if (!peers.TryRemove(peerId, out peer)) return;
+        try { peer.Close(); } catch { }
+    }
+
     private bool Write(TcpClient socket, byte[] bytes, int peerId)
     {
         try { lock (socket) { NetworkStream stream = socket.GetStream(); stream.Write(bytes, 0, bytes.Length); } return true; }
-        catch { TcpClient removed; if (peerId >= 0) peers.TryRemove(peerId, out removed); return false; }
+        catch
+        {
+            TcpClient removed;
+            if (peerId >= 0) peers.TryRemove(peerId, out removed);
+            else { clientConnected = false; try { socket.Close(); } catch { } }
+            return false;
+        }
     }
 
     internal void Stop()
     {
-        running = false; try { listener?.Stop(); } catch { } try { client?.Close(); } catch { }
+        running = false; clientConnected = false; try { listener?.Stop(); } catch { } try { client?.Close(); } catch { }
         foreach (var peer in peers.Values) try { peer.Close(); } catch { } peers.Clear(); listener = null; client = null;
     }
 }

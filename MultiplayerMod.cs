@@ -8,11 +8,10 @@ using MelonLoader;
 using Steamworks;
 using UnityEngine;
 using UnityEngine.SceneManagement;
-using UnityEngine.Tilemaps;
 
 namespace CosmodrillMultiplayer;
 
-public sealed class MultiplayerMod : MelonMod
+public sealed partial class MultiplayerMod : MelonMod
 {
     private static MultiplayerMod active;
     private static readonly HashSet<int> managedNetIds = new HashSet<int>();
@@ -20,16 +19,11 @@ public sealed class MultiplayerMod : MelonMod
     private readonly Dictionary<string, GameObject> avatars = new Dictionary<string, GameObject>();
     private readonly Dictionary<string, string> peerNames = new Dictionary<string, string>();
     private readonly Dictionary<int, string> replicationPeerIds = new Dictionary<int, string>();
-    private readonly Dictionary<string, long> currencyRequestSequences = new Dictionary<string, long>();
-    private readonly Dictionary<string, PendingLightingReveal> pendingLightingReveals = new Dictionary<string, PendingLightingReveal>();
-    private readonly SortedDictionary<int, string> bootstrapChunks = new SortedDictionary<int, string>();
-    private readonly string localId = Guid.NewGuid().ToString("N");
+    private string localId;
     private BasicNetManager net;
     private NetClient clientTransport;
     private NetServer serverTransport;
     private ReplicationChannel replication;
-    private PlayerDrill hookedDrill;
-    private bool gadgetBombHooked;
     private string status = "Offline";
     private string joinInput = "";
     private string manualIp = "127.0.0.1";
@@ -47,41 +41,17 @@ public sealed class MultiplayerMod : MelonMod
     private float sendTimer;
     private float readinessLogTimer;
     private float trafficLogTimer;
-    private float currencySyncTimer;
-    private float pendingRevealTimer;
     private int positionsSent;
     private int positionsReceived;
-    private int tilesSent;
-    private int tilesReceived;
-    private int currencyDeltasSent;
-    private int currencyDeltasReceived;
-    private int currencySnapshotsSent;
-    private int currencySnapshotsReceived;
-    private int lightingRevealsApplied;
-    private long nextCurrencyRequestSequence;
-    private long currencyRevision;
-    private long lastCurrencyRevision;
-    private bool applyingSharedCurrency;
-    private bool stationCurrencyRequestActive;
-    private bool stationCurrencyRequestSucceeded;
-    private bool applyingRemoteTile;
-    private int bootstrapExpected;
-    private int bootstrapSaveIndex = -1;
-    private string bootstrapScene = "";
 
-    private sealed class PendingLightingReveal
-    {
-        internal string MapName;
-        internal Vector3Int Cell;
-    }
-
-    private bool TransportConnected => net != null && ((isHost && net.server != null && net.server.running) || (!isHost && net.client != null && net.client.connected));
+    private bool TransportConnected => net != null && ((isHost && net.server != null && net.server.running) || (!isHost && ((net.client != null && net.client.connected) || (replication != null && replication.IsConnected))));
     private bool Connected => net != null && sessionApproved;
 
     public override void OnInitializeMelon()
     {
         active = this;
         Application.runInBackground = true;
+        LoadOrCreatePlayerId();
         InstallGameplayPatches();
         InstallPortableCopyPatches();
         LoadPlayerName();
@@ -91,62 +61,8 @@ public sealed class MultiplayerMod : MelonMod
 
     private void InstallGameplayPatches()
     {
-        try
-        {
-            var harmony = new global::HarmonyLib.Harmony("cosmodrill.multiplayer.gameplay");
-            harmony.Patch(global::HarmonyLib.AccessTools.Method(typeof(PlayerCurrency), nameof(PlayerCurrency.ChangeCurrency), new[] { typeof(ResourceTypes), typeof(float) }),
-                prefix: new global::HarmonyLib.HarmonyMethod(typeof(MultiplayerMod), nameof(BeforeCurrencyChange)),
-                postfix: new global::HarmonyLib.HarmonyMethod(typeof(MultiplayerMod), nameof(AfterCurrencyChange)));
-            harmony.Patch(global::HarmonyLib.AccessTools.Method(typeof(ResourceDeliveryStation), nameof(ResourceDeliveryStation.BuyResourceFromPlayer), new[] { typeof(string) }),
-                prefix: new global::HarmonyLib.HarmonyMethod(typeof(MultiplayerMod), nameof(BeforeStationResourcePurchase)),
-                postfix: new global::HarmonyLib.HarmonyMethod(typeof(MultiplayerMod), nameof(AfterStationResourcePurchase)));
-            Log("ECONOMY", "Installed shared station-inventory hooks");
-        }
-        catch (Exception ex) { LogError("ECONOMY", "Could not install shared inventory hooks: " + ex); }
-    }
-
-    private static bool BeforeCurrencyChange(ResourceTypes __0, float __1)
-    {
-        return active == null || active.HandleCurrencyChangeRequest(__0, __1);
-    }
-
-    private static void AfterCurrencyChange(ResourceTypes __0, float __1)
-    {
-        if (active == null || active.applyingSharedCurrency || !active.Connected || !active.sceneReady || !active.isHost) return;
-        active.BroadcastCurrencySnapshot("host currency changed");
-    }
-
-    private static void BeforeStationResourcePurchase(ResourceDeliveryStation __instance)
-    {
-        if (active == null) return;
-        active.stationCurrencyRequestActive = active.Connected && active.sceneReady && !active.isHost && __instance != null && !__instance.IsDestroyedStation;
-        active.stationCurrencyRequestSucceeded = false;
-    }
-
-    private static void AfterStationResourcePurchase(ref bool __result)
-    {
-        if (active == null || !active.stationCurrencyRequestActive) return;
-        if (!active.stationCurrencyRequestSucceeded) __result = false;
-        active.stationCurrencyRequestActive = false;
-        active.stationCurrencyRequestSucceeded = false;
-    }
-
-    private bool HandleCurrencyChangeRequest(ResourceTypes resourceType, float amount)
-    {
-        if (applyingSharedCurrency || !Connected || !sceneReady || isHost) return true;
-        if (!Finite(amount) || amount == 0f || Math.Abs(amount) > 100000f || !Enum.IsDefined(typeof(ResourceTypes), resourceType))
-        {
-            LogWarn("ECONOMY", "Blocked invalid guest currency delta for " + resourceType + ": " + amount);
-            return false;
-        }
-        long sequence = ++nextCurrencyRequestSequence;
-        bool sent = replication != null && replication.Send("D|" + localId + "|" + sequence + "|" + (int)resourceType + "|" + F(amount));
-        if (stationCurrencyRequestActive) stationCurrencyRequestSucceeded = sent;
-        if (sent) currencyDeltasSent++;
-        else LogWarn("ECONOMY", "Shared inventory request could not reach the host; local balance was left unchanged");
-        // Guests never directly mutate the shared ledger. The host's absolute
-        // snapshot is applied to every peer, including the requesting guest.
-        return false;
+        InstallEconomyPatches();
+        InstallEnemyPatches();
     }
 
     private void InstallPortableCopyPatches()
@@ -206,7 +122,7 @@ public sealed class MultiplayerMod : MelonMod
 
     public override void OnSceneWasLoaded(int buildIndex, string sceneName)
     {
-        currentScene = sceneName; sceneReady = false; hookedDrill = null; currencySyncTimer = 2f; pendingRevealTimer = 0f; pendingLightingReveals.Clear(); ClearAvatars();
+        currentScene = sceneName; sceneReady = false; hookedDrill = null; currencySyncTimer = 2f; pendingRevealTimer = 0f; pendingEnemyTimer = 0f; pendingLightingReveals.Clear(); pendingEnemyDeaths.Clear(); requestedEnemyDeaths.Clear(); appliedEnemyDeaths.Clear(); recentlyAppliedEnemyLocators.Clear(); ClearAvatars();
         Log("SCENE", "Loaded " + sceneName + "; waiting for save, player, and tilemaps");
         if (Connected && isHost) Send("/cdmp-s " + B64(sceneName), true);
     }
@@ -217,7 +133,7 @@ public sealed class MultiplayerMod : MelonMod
         PumpEzNet();
         RefreshPlayerRegistry();
         TrySendHandshake("update");
-        UpdateReadiness(); HookDrill(); UpdateCurrencySynchronization(); ProcessPendingLightingReveals();
+        UpdateReadiness(); UpdatePlayerSessionSynchronization(); HookDrill(); UpdateCurrencySynchronization(); ProcessPendingLightingReveals(); ProcessPendingEnemyDeaths();
         if (Connected && sceneReady && PlayerDrill.Instance != null && (sendTimer += Time.unscaledDeltaTime) >= 0.2f)
         {
             sendTimer = 0f; Transform t = PlayerDrill.Instance.PlayerRB == null ? PlayerDrill.Instance.transform : PlayerDrill.Instance.PlayerRB.transform;
@@ -228,26 +144,20 @@ public sealed class MultiplayerMod : MelonMod
             bool rightJet = PlayerAlternativeMovement2.Instance != null && PlayerAlternativeMovement2.Instance.rightRocket != null && PlayerAlternativeMovement2.Instance.rightRocket.enabled;
             if (replication != null && replication.Send("P|" + localId + "|" + B64(playerName) + "|" + F(t.position.x) + "|" + F(t.position.y) + "|" + F(t.position.z) + "|" + F(t.eulerAngles.z) + "|" + F(velocity.x) + "|" + F(velocity.y) + "|" + (drilling ? "1" : "0") + "|" + (moving ? "1" : "0") + "|" + (leftJet ? "1" : "0") + "|" + (rightJet ? "1" : "0"))) positionsSent++;
         }
-        if (Connected && (trafficLogTimer += Time.unscaledDeltaTime) >= 5f) { trafficLogTimer = 0f; Log("TRAFFIC", "Positions sent=" + positionsSent + ", received=" + positionsReceived + ", avatars=" + avatars.Count + "; tiles sent=" + tilesSent + ", received=" + tilesReceived + ", lighting reveals=" + lightingRevealsApplied + ", pending=" + pendingLightingReveals.Count + "; economy deltas sent=" + currencyDeltasSent + ", received=" + currencyDeltasReceived + ", snapshots sent=" + currencySnapshotsSent + ", received=" + currencySnapshotsReceived); }
+        if (Connected && (trafficLogTimer += Time.unscaledDeltaTime) >= 5f) { trafficLogTimer = 0f; Log("TRAFFIC", "Positions sent=" + positionsSent + ", received=" + positionsReceived + ", avatars=" + avatars.Count + "; tiles sent=" + tilesSent + ", received=" + tilesReceived + ", lighting reveals=" + lightingRevealsApplied + ", pending=" + pendingLightingReveals.Count + "; enemy kills requested=" + enemyKillsRequested + ", confirmed=" + enemyKillsConfirmed + ", applied=" + enemyKillsApplied + ", pending=" + pendingEnemyDeaths.Count + "; economy deltas sent=" + currencyDeltasSent + ", received=" + currencyDeltasReceived + ", snapshots sent=" + currencySnapshotsSent + ", received=" + currencySnapshotsReceived); }
     }
 
     private void RefreshPlayerRegistry()
     {
-        if (!Connected || net == null) return;
-        if (isHost && net.server != null && net.server.clientNames != null)
-        {
-            foreach (KeyValuePair<byte, string> entry in net.server.clientNames)
-                if (!string.IsNullOrWhiteSpace(entry.Value)) peerNames["eznet-" + entry.Key] = entry.Value.Replace('_', ' ');
-        }
-        else if (!isHost && net.client != null && net.client.clientNames != null)
-        {
-            foreach (KeyValuePair<byte, string> entry in net.client.clientNames)
-                if (!string.IsNullOrWhiteSpace(entry.Value) && entry.Key != net.client.cid) peerNames["eznet-" + entry.Key] = entry.Value.Replace('_', ' ');
-        }
+        // Persistent /cdmp and state-channel identities now provide the registry.
+        // Remove legacy EZNet fallback rows so a disconnected transport entry
+        // cannot remain as a duplicate or ghost player in the co-op panel.
+        foreach (string fallback in peerNames.Keys.Where(key => key.StartsWith("eznet-", StringComparison.Ordinal)).ToList()) peerNames.Remove(fallback);
     }
 
     public override void OnGUI()
     {
+        DrawTeammateLocator();
         if (!panelOpen)
         {
             if (GUI.Button(new Rect(Screen.width - 225, 30, 190, 44), currentScene == "MainMenu" ? "CO-OP MULTIPLAYER" : "CO-OP")) panelOpen = true;
@@ -287,6 +197,7 @@ public sealed class MultiplayerMod : MelonMod
             }
             GUI.Label(new Rect(x + 20, 320, 360, 42), isHost ? "Choose a save normally. Guests follow your scene." : "The host controls scene travel.");
             if (GUI.Button(new Rect(x + 20, 362, 175, 38), "DISCONNECT")) StopNetwork("Disconnected");
+            if (GUI.Button(new Rect(x + 205, 362, 175, 38), "LOCATOR: " + (teammateLocatorEnabled ? "ON" : "OFF"))) teammateLocatorEnabled = !teammateLocatorEnabled;
         }
         if (GUI.Button(new Rect(x + 210, 448, 170, 34), "CLOSE")) panelOpen = false;
     }
@@ -314,7 +225,7 @@ public sealed class MultiplayerMod : MelonMod
     {
         try
         {
-            StopNetwork("Starting host"); isHost = true; net = CreateManager(true, port, (ushort)(port + 1), 0); net.Init(); serverTransport = net.server; net.ServerStart();
+            StopNetwork("Starting host"); isHost = true; LoadHostReconnectRecords(); net = CreateManager(true, port, (ushort)(port + 1), 0); net.Init(); serverTransport = net.server; net.ServerStart();
             replication = new ReplicationChannel(OnReplicationLine, OnReplicationDisconnected, m => Log("STATE", m)); replication.StartServer(port + 2); sessionApproved = true;
             joinCode = JoinCode.Encode(advertisedIp, port); status = "Hosting on TCP " + port + " / UDP " + (port + 1);
             Log("SERVER", "Started; advertised=" + advertisedIp + ", TCP=" + port + ", UDP=" + (port + 1) + ", code=" + joinCode);
@@ -386,29 +297,6 @@ public sealed class MultiplayerMod : MelonMod
     {
         manager.server.SendCommand(clientId, "/cdmp-w " + clientId + "|" + B64(currentScene) + "|" + localId + "|" + B64(playerName));
         Log("SESSION", "Welcome sent to client ID " + clientId + " for " + currentScene);
-        SendWorldBootstrap(manager, clientId);
-    }
-
-    private void SendWorldBootstrap(BasicNetManager manager, byte clientId)
-    {
-        try
-        {
-            int index = ScriptableObjectHolder.Instance == null ? -1 : ScriptableObjectHolder.Instance.ThisVariousSaveData.saveFileIndex;
-            string path = index < 0 ? "" : GetSavePath(index);
-            if (index < 0 || !File.Exists(path)) throw new Exception("Host has no active saved world (index " + index + ")");
-            byte[] bytes = File.ReadAllBytes(path);
-            string encoded = Convert.ToBase64String(bytes);
-            const int chunkSize = 700;
-            int total = (encoded.Length + chunkSize - 1) / chunkSize;
-            manager.server.SendCommand(clientId, "/cdmp-begin " + index + "|" + total + "|" + B64(currentScene) + "|" + bytes.Length);
-            for (int i = 0; i < total; i++)
-            {
-                int length = Math.Min(chunkSize, encoded.Length - i * chunkSize);
-                manager.server.SendCommand(clientId, "/cdmp-b " + i + "|" + encoded.Substring(i * chunkSize, length));
-            }
-            Log("BOOTSTRAP", "Sent save" + index + " snapshot (" + bytes.Length + " bytes, " + total + " chunks) to client " + clientId);
-        }
-        catch (Exception ex) { LogError("BOOTSTRAP", ex.Message); manager.server.SendCommand(clientId, "/cdmp-f " + B64(ex.Message)); }
     }
 
     private void OnCommand(NetCMD cmd)
@@ -431,34 +319,40 @@ public sealed class MultiplayerMod : MelonMod
                 if (welcome.Length < 4 || !byte.TryParse(welcome[0], out assigned) || assigned == 0) throw new Exception("Invalid server welcome");
                 net.client.cid = assigned;
                 AccessTools.Field(typeof(NetClient), "cidinit").SetValue(net.client, true);
+                if (welcome[2].Length != 32) throw new Exception("Invalid persistent host ID");
+                currentHostId = welcome[2];
                 peerNames[welcome[2]] = UB64(welcome[3]);
                 sessionApproved = true;
+                worldBootstrapApplied = false;
                 bootstrapScene = UB64(welcome[1]);
                 status = "Connected — waiting for host world";
                 Log("SESSION", "Server approved connection as client ID " + assigned + "; host=" + peerNames[welcome[2]] + "; awaiting world snapshot");
             }
-            else if (type == "/cdmp-begin" && !isHost)
-            {
-                string[] begin = data.Split('|');
-                bootstrapSaveIndex = int.Parse(begin[0]); bootstrapExpected = int.Parse(begin[1]); bootstrapScene = UB64(begin[2]); bootstrapChunks.Clear();
-                status = "Receiving host world (0/" + bootstrapExpected + ")";
-                Log("BOOTSTRAP", "Receiving save" + bootstrapSaveIndex + " in " + bootstrapExpected + " chunks (" + begin[3] + " bytes)");
-            }
-            else if (type == "/cdmp-b" && !isHost)
-            {
-                int split = data.IndexOf('|'); if (split <= 0) throw new Exception("Invalid world chunk");
-                int sequence = int.Parse(data.Substring(0, split)); bootstrapChunks[sequence] = data.Substring(split + 1);
-                status = "Receiving host world (" + bootstrapChunks.Count + "/" + bootstrapExpected + ")";
-                if (bootstrapExpected > 0 && bootstrapChunks.Count == bootstrapExpected) ApplyWorldBootstrap();
-            }
-            else if (type == "/cdmp-f" && !isHost) { status = "Host world failed: " + UB64(data); LogError("BOOTSTRAP", status); }
             else if (type == "/cdmp-a" && !isHost)
             {
                 string[] accepted = data.Split('|');
-                if (accepted.Length >= 3) peerNames[accepted[1]] = UB64(accepted[2]);
-                status = "Connected to host"; Travel(UB64(accepted[0])); Log("CLIENT", "Host accepted connection");
+                if (accepted.Length >= 3) { currentHostId = accepted[1]; peerNames[accepted[1]] = UB64(accepted[2]); }
+                string acceptedScene = accepted.Length > 0 ? UB64(accepted[0]) : "";
+                if (worldBootstrapApplied)
+                {
+                    status = "Connected to host";
+                    Travel(acceptedScene);
+                    Log("CLIENT", "Host accepted connection; authoritative world is ready");
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(acceptedScene)) bootstrapScene = acceptedScene;
+                    status = "Accepted — waiting for host world";
+                    Log("CLIENT", "Host accepted connection; scene travel deferred until the authoritative world snapshot is applied");
+                }
             }
-            else if (type == "/cdmp-s" && !isHost) { TrySendHandshake("scene command"); Travel(UB64(data)); }
+            else if (type == "/cdmp-s" && !isHost)
+            {
+                TrySendHandshake("scene command");
+                string requestedScene = UB64(data);
+                if (worldBootstrapApplied) Travel(requestedScene);
+                else { bootstrapScene = requestedScene; Log("SCENE", "Deferred host scene command until world bootstrap completes: " + requestedScene); }
+            }
         }
         catch (Exception ex) { LogWarn("PROTOCOL", "Rejected " + type + ": " + ex.Message); }
     }
@@ -474,50 +368,7 @@ public sealed class MultiplayerMod : MelonMod
                 string id = p[1];
                 if (id.Length != 32) throw new Exception("Invalid player ID");
                 if (isHost) BindReplicationIdentity(connectionId, id);
-                if (p[0] == "D")
-                {
-                    if (!isHost || p.Length != 5) throw new Exception("Invalid currency delta");
-                    long sequence = long.Parse(p[2], CultureInfo.InvariantCulture);
-                    int typeValue = int.Parse(p[3], CultureInfo.InvariantCulture);
-                    float amount = P(p[4]);
-                    if (sequence <= 0 || !Enum.IsDefined(typeof(ResourceTypes), typeValue) || !Finite(amount) || amount == 0f || Math.Abs(amount) > 100000f) throw new Exception("Invalid currency delta values");
-                    long lastSequence;
-                    if (currencyRequestSequences.TryGetValue(id, out lastSequence) && sequence <= lastSequence) throw new Exception("Stale currency delta sequence");
-                    currencyRequestSequences[id] = sequence;
-                    ApplyAuthoritativeCurrencyDelta(id, (ResourceTypes)typeValue, amount);
-                    return;
-                }
-                if (p[0] == "C")
-                {
-                    if (isHost || p.Length != 10) throw new Exception("Invalid currency snapshot");
-                    long revision = long.Parse(p[2], CultureInfo.InvariantCulture);
-                    if (revision <= lastCurrencyRevision) return;
-                    float[] amounts = new float[7];
-                    for (int i = 0; i < amounts.Length; i++)
-                    {
-                        amounts[i] = P(p[i + 3]);
-                        if (!Finite(amounts[i]) || amounts[i] < 0f || amounts[i] > 100000000f) throw new Exception("Invalid currency snapshot amount");
-                    }
-                    ApplyCurrencySnapshot(revision, amounts);
-                    return;
-                }
-                if (p[0] == "T")
-                {
-                    if (p.Length != 6) throw new Exception("Invalid tile state");
-                    string mapName = UB64(p[2]); if (mapName.Length == 0 || mapName.Length > 128) throw new Exception("Invalid tilemap name");
-                    int cellX = int.Parse(p[3]), cellY = int.Parse(p[4]), cellZ = int.Parse(p[5]);
-                    ApplyTile(mapName, cellX, cellY, cellZ); tilesReceived++;
-                    if (isHost && replication != null) replication.Send("T|" + id + "|" + B64(mapName) + "|" + cellX + "|" + cellY + "|" + cellZ);
-                    return;
-                }
-                if (p.Length < 10 || p[0] != "P") return;
-                string name = UB64(p[2]); if (name.Length > 24) name = name.Substring(0, 24);
-                float x = P(p[3]), y = P(p[4]), z = P(p[5]), rotation = P(p[6]), vx = P(p[7]), vy = P(p[8]);
-                if (!Finite(x) || !Finite(y) || !Finite(z) || !Finite(rotation) || !Finite(vx) || !Finite(vy)) throw new Exception("Non-finite player state");
-                peerNames[id] = name; positionsReceived++;
-                bool drilling = p[9] == "1", moving = p.Length > 10 ? p[10] == "1" : (vx * vx + vy * vy > .04f), leftJet = p.Length > 11 && p[11] == "1", rightJet = p.Length > 12 && p[12] == "1";
-                ApplyPosition(id, x, y, z, rotation, vx, vy, drilling, moving, leftJet, rightJet);
-                if (isHost && replication != null) replication.Send("P|" + id + "|" + B64(name) + "|" + F(x) + "|" + F(y) + "|" + F(z) + "|" + F(rotation) + "|" + F(vx) + "|" + F(vy) + "|" + (drilling ? "1" : "0") + "|" + (moving ? "1" : "0") + "|" + (leftJet ? "1" : "0") + "|" + (rightJet ? "1" : "0"));
+                if (TryHandlePlayerSessionReplication(connectionId, p, id) || TryHandleEnemyReplication(p, id) || TryHandleEconomyReplication(p, id) || TryHandleWorldReplication(p, id)) return;
             }
             catch (Exception ex) { LogWarn("STATE", "Rejected replication state: " + ex.Message); }
         });
@@ -527,114 +378,16 @@ public sealed class MultiplayerMod : MelonMod
     {
         string bound; if (replicationPeerIds.TryGetValue(connectionId, out bound) && bound != id) throw new Exception("Connection attempted to change player identity");
         replicationPeerIds[connectionId] = id;
-    }
-
-    private void UpdateCurrencySynchronization()
-    {
-        if (!Connected || !sceneReady || !isHost || PlayerCurrency.Instance == null) return;
-        currencySyncTimer += Time.unscaledDeltaTime;
-        if (currencySyncTimer < 2f) return;
-        currencySyncTimer = 0f;
-        BroadcastCurrencySnapshot("periodic reconciliation");
-    }
-
-    private void ApplyAuthoritativeCurrencyDelta(string playerId, ResourceTypes resourceType, float amount)
-    {
-        if (PlayerCurrency.Instance == null)
-        {
-            LogWarn("ECONOMY", "Rejected currency delta because the host inventory is not ready");
-            return;
-        }
-        float current = PlayerCurrency.Instance.GetResourceAmount(resourceType);
-        if (amount < 0f && current + amount < -0.001f)
-        {
-            LogWarn("ECONOMY", "Rejected unaffordable " + resourceType + " spend of " + (-amount) + " from " + playerId.Substring(0, 8) + "; available=" + current);
-            BroadcastCurrencySnapshot("rejected unaffordable spend");
-            return;
-        }
-        applyingSharedCurrency = true;
-        try { PlayerCurrency.Instance.ChangeCurrency(resourceType, amount); }
-        finally { applyingSharedCurrency = false; }
-        currencyDeltasReceived++;
-        Log("ECONOMY", "Accepted " + playerId.Substring(0, 8) + " " + resourceType + " delta " + (amount > 0f ? "+" : "") + F(amount) + "; shared total=" + F(PlayerCurrency.Instance.GetResourceAmount(resourceType)));
-        BroadcastCurrencySnapshot("guest currency delta");
-    }
-
-    private void BroadcastCurrencySnapshot(string reason)
-    {
-        if (!isHost || replication == null || PlayerCurrency.Instance == null) return;
-        var frame = new StringBuilder("C|").Append(localId).Append('|').Append(++currencyRevision);
-        int resourceCount = Enum.GetValues(typeof(ResourceTypes)).Length;
-        for (int i = 0; i < resourceCount; i++) frame.Append('|').Append(F(PlayerCurrency.Instance.GetResourceAmount((ResourceTypes)i)));
-        if (replication.Send(frame.ToString())) currencySnapshotsSent++;
-    }
-
-    private void ApplyCurrencySnapshot(long revision, float[] amounts)
-    {
-        if (PlayerCurrency.Instance == null || amounts == null || amounts.Length != Enum.GetValues(typeof(ResourceTypes)).Length) return;
-        bool firstSnapshot = lastCurrencyRevision == 0;
-        applyingSharedCurrency = true;
-        try
-        {
-            foreach (Currency currency in PlayerCurrency.Instance.CurrencyList)
-            {
-                int index = (int)currency.CurrencyType;
-                if (index < 0 || index >= amounts.Length) continue;
-                currency.CurrentCurrencyAmount = amounts[index];
-                currency.UpdateCurrencyCounter();
-            }
-            PlayerCurrency.Instance.CurrencyChanged?.Invoke();
-            lastCurrencyRevision = revision;
-            currencySnapshotsReceived++;
-        }
-        finally { applyingSharedCurrency = false; }
-        if (firstSnapshot) Log("ECONOMY", "Shared station inventory synchronized at revision " + revision + ": " + FormatCurrencyAmounts(amounts));
-    }
-
-    private static string FormatCurrencyAmounts(float[] amounts)
-    {
-        var result = new StringBuilder();
-        for (int i = 0; i < amounts.Length; i++)
-        {
-            if (i > 0) result.Append(", ");
-            result.Append((ResourceTypes)i).Append('=').Append(F(amounts[i]));
-        }
-        return result.ToString();
+        RegisterReplicationIdentity(connectionId, id);
     }
 
     private void OnReplicationDisconnected(int connectionId)
     {
         if (connectionId < 0) return;
-        mainThread.Enqueue(() => { string id; if (!replicationPeerIds.TryGetValue(connectionId, out id)) return; replicationPeerIds.Remove(connectionId); currencyRequestSequences.Remove(id); peerNames.Remove(id); GameObject avatar; if (avatars.TryGetValue(id, out avatar)) { if (avatar != null) UnityEngine.Object.Destroy(avatar); avatars.Remove(id); } Log("STATE", "Player state connection closed: " + id.Substring(0, 8)); });
+        mainThread.Enqueue(() => HandleReplicationDisconnected(connectionId));
     }
 
     private static bool Finite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
-
-    private void ApplyWorldBootstrap()
-    {
-        var encoded = new StringBuilder();
-        for (int i = 0; i < bootstrapExpected; i++) { string chunk; if (!bootstrapChunks.TryGetValue(i, out chunk)) throw new Exception("Missing world chunk " + i); encoded.Append(chunk); }
-        byte[] bytes = Convert.FromBase64String(encoded.ToString());
-        string path = GetSavePath(bootstrapSaveIndex); Directory.CreateDirectory(Path.GetDirectoryName(path)); File.WriteAllBytes(path, bytes);
-        if (SaveManager.Instance == null || ScriptableObjectHolder.Instance == null) throw new Exception("Save system is unavailable");
-        FullSaveFile save = SaveManager.Instance.LoadData(bootstrapSaveIndex);
-        if (save == null || save.isEmptyFile) throw new Exception("Host snapshot could not be decoded");
-        ScriptableObjectHolder.Instance.LoadDataFromSaveFile(save);
-        ScriptableObjectHolder.Instance.ThisVariousSaveData.saveFileIndex = bootstrapSaveIndex;
-        ScriptableObjectHolder.Instance.hasLoaded = true;
-        handshakePending = true; handshakeSent = false;
-        clientTransport.SendCommand("/myname :" + playerName.Replace(" ", "_"));
-        TrySendHandshake("world bootstrap");
-        Log("BOOTSTRAP", "Host save" + bootstrapSaveIndex + " applied (" + bytes.Length + " bytes); entering " + bootstrapScene);
-        bootstrapChunks.Clear(); bootstrapExpected = 0;
-        Travel(bootstrapScene);
-    }
-
-    private static string GetSavePath(int index)
-    {
-        string root = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
-        return Path.Combine(root, "UserData", "Saves", "save" + index + ".dat");
-    }
 
     private void Send(string command, bool reliable)
     {
@@ -683,101 +436,6 @@ public sealed class MultiplayerMod : MelonMod
         }
     }
 
-    private void HookDrill()
-    {
-        if (!sceneReady || PlayerDrill.Instance == null) return;
-        if (!gadgetBombHooked)
-        {
-            GadgetBomb.TileRemoved -= OnBombTileRemoved;
-            GadgetBomb.TileRemoved += OnBombTileRemoved;
-            gadgetBombHooked = true;
-            Log("SYNC", "Gadget-bomb tile hook attached");
-        }
-        if (hookedDrill == PlayerDrill.Instance) return;
-        if (hookedDrill != null) hookedDrill.TileRemoved -= OnTileRemoved;
-        hookedDrill = PlayerDrill.Instance;
-        hookedDrill.TileRemoved += OnTileRemoved;
-        Log("SYNC", "Drill tile hook attached");
-    }
-
-    private void OnBombTileRemoved(Tilemap map, Vector3Int cell)
-    {
-        if (!applyingRemoteTile && map != null) TryApplyLightingReveal(map, cell);
-        OnTileRemoved(map, cell);
-    }
-    private void OnTileRemoved(Tilemap map, Vector3Int cell)
-    {
-        if (applyingRemoteTile || !sceneReady || map == null || replication == null) return;
-        if (replication.Send("T|" + localId + "|" + B64(map.gameObject.name) + "|" + cell.x + "|" + cell.y + "|" + cell.z)) tilesSent++;
-    }
-
-    private void ApplyTile(string name, int x, int y, int z)
-    {
-        Vector3Int cell = new Vector3Int(x, y, z);
-        bool found = false, hasLightingTarget = false, lightingApplied = false;
-        foreach (Tilemap map in UnityEngine.Object.FindObjectsByType<Tilemap>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-        {
-            if (map == null || map.gameObject.name != name) continue;
-            found = true;
-            map.SetTile(cell, null);
-            // Local drilling raises this action after SetTile. Replaying it is what
-            // updates TileCollisionCache and TilemapSaveDataManager for a remote dig.
-            // The guard prevents our own network subscriber from echoing the tile.
-            applyingRemoteTile = true;
-            try { PlayerDrill.Instance?.TileRemoved?.Invoke(map, cell); }
-            finally { applyingRemoteTile = false; }
-            if (map.GetComponent<TileLighting>() != null)
-            {
-                hasLightingTarget = true;
-                if (TryApplyLightingReveal(map, cell)) lightingApplied = true;
-            }
-        }
-        if (!found || (hasLightingTarget && !lightingApplied))
-        {
-            string key = name + "|" + x + "|" + y + "|" + z;
-            pendingLightingReveals[key] = new PendingLightingReveal { MapName = name, Cell = cell };
-        }
-    }
-
-    private bool TryApplyLightingReveal(Tilemap map, Vector3Int cell)
-    {
-        if (map == null || !map.enabled || !map.gameObject.activeInHierarchy) return false;
-        TileLighting lighting = map.GetComponent<TileLighting>();
-        if (lighting == null) return false;
-        lighting.RecalculateBrightnessAroundTile(cell);
-        lightingRevealsApplied++;
-        return true;
-    }
-
-    private void ProcessPendingLightingReveals()
-    {
-        if (!sceneReady || pendingLightingReveals.Count == 0 || (pendingRevealTimer += Time.unscaledDeltaTime) < 1f) return;
-        pendingRevealTimer = 0f;
-        Tilemap[] maps = UnityEngine.Object.FindObjectsByType<Tilemap>(FindObjectsInactive.Include, FindObjectsSortMode.None);
-        var completed = new List<string>();
-        int processed = 0;
-        foreach (KeyValuePair<string, PendingLightingReveal> entry in pendingLightingReveals)
-        {
-            bool matched = false, hasLightingTarget = false, applied = false;
-            foreach (Tilemap map in maps)
-            {
-                if (map == null || map.gameObject.name != entry.Value.MapName) continue;
-                matched = true;
-                // A streaming loader may have repopulated the runtime tilemap while
-                // it was inactive, so enforce the authoritative removal once more.
-                map.SetTile(entry.Value.Cell, null);
-                if (map.GetComponent<TileLighting>() != null)
-                {
-                    hasLightingTarget = true;
-                    if (TryApplyLightingReveal(map, entry.Value.Cell)) applied = true;
-                }
-            }
-            if (applied || (matched && !hasLightingTarget)) completed.Add(entry.Key);
-            if (++processed >= 128) break;
-        }
-        foreach (string key in completed) pendingLightingReveals.Remove(key);
-        if (completed.Count > 0) Log("LIGHTING", "Applied " + completed.Count + " deferred shared tunnel reveal(s); pending=" + pendingLightingReveals.Count);
-    }
     private void ApplyPosition(string id, float x, float y, float z, float r, float vx, float vy, bool drilling, bool moving, bool leftJet, bool rightJet)
     {
         if (PlayerDrill.Instance == null || PlayerDrill.Instance.PlayerRB == null || PlayerHealth.Instance == null || RocketVisualizer.Instance == null || RocketTrail.Instance == null || PlayerAlternativeMovement2.Instance == null) return;
@@ -885,6 +543,7 @@ public sealed class MultiplayerMod : MelonMod
     }
     private void StopNetwork(string reason)
     {
+        BeforeNetworkStop(reason);
         try
         {
             replication?.Stop();
@@ -900,15 +559,24 @@ public sealed class MultiplayerMod : MelonMod
         replication = null;
         replicationPeerIds.Clear();
         currencyRequestSequences.Clear();
+        enemyKillRequestSequences.Clear();
         pendingLightingReveals.Clear();
+        pendingEnemyDeaths.Clear();
+        requestedEnemyDeaths.Clear();
+        appliedEnemyDeaths.Clear();
+        recentlyAppliedEnemyLocators.Clear();
+        bootstrapSentConnections.Clear();
         net = null; clientTransport = null; serverTransport = null;
-        isHost = false; sceneReady = false; sessionApproved = false; handshakePending = false; handshakeSent = false;
-        applyingSharedCurrency = false; stationCurrencyRequestActive = false; stationCurrencyRequestSucceeded = false; applyingRemoteTile = false;
+        isHost = false; sceneReady = false; sessionApproved = false; handshakePending = false; handshakeSent = false; worldBootstrapApplied = false;
+        applyingSharedCurrency = false; stationCurrencyRequestActive = false; stationCurrencyRequestSucceeded = false; applyingRemoteTile = false; applyingEnemyDeath = false;
         positionsSent = 0; positionsReceived = 0; tilesSent = 0; tilesReceived = 0;
         currencyDeltasSent = 0; currencyDeltasReceived = 0; currencySnapshotsSent = 0; currencySnapshotsReceived = 0;
-        lightingRevealsApplied = 0; pendingRevealTimer = 0f;
+        lightingRevealsApplied = 0; pendingRevealTimer = 0f; pendingEnemyTimer = 0f;
+        enemyKillsRequested = 0; enemyKillsConfirmed = 0; enemyKillsApplied = 0;
         nextCurrencyRequestSequence = 0; currencyRevision = 0; lastCurrencyRevision = 0; currencySyncTimer = 0f;
-        bootstrapChunks.Clear(); bootstrapExpected = 0; bootstrapSaveIndex = -1;
+        nextEnemyKillSequence = 0; enemyKillRevision = 0;
+        bootstrapChunks.Clear(); bootstrapExpected = 0; bootstrapExpectedBytes = 0; bootstrapExpectedHash = ""; bootstrapSaveIndex = -1; bootstrapScene = "";
+        ResetPlayerSessionNetworkState();
         status = reason; peerNames.Clear(); ClearAvatars();
     }
     private void LoadPlayerName() { try { string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserData", "CosmodrillMultiplayer.name"); if (File.Exists(path)) { string value = File.ReadAllText(path).Trim(); if (!string.IsNullOrEmpty(value)) playerName = value; } } catch { } }

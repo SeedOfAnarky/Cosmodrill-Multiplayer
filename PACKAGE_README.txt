@@ -1,4 +1,4 @@
-Cosmodrill Multiplayer v0.5.6
+Cosmodrill Multiplayer v0.5.12
 ================================
 
 Requirements
@@ -34,6 +34,10 @@ The host menu creates the join code. Automatic UPnP maps the selected TCP port,
 the following UDP port, and the second following TCP state-replication port.
 If UPnP is unavailable, forward all three ports on the host router.
 
+The host may open the server before or after selecting a save. Guests who join
+while the host world is loading remain connected and enter automatically after
+the host save, player, and tilemaps are ready.
+
 Shared resources
 ----------------
 Delivered station resources use the host's inventory as the shared ledger.
@@ -45,3 +49,14 @@ Shared tunnels
 --------------
 Drill and gadget-bomb tile removals are shared through the host. Remote tunnels
 update collision caches, removed-tile save data, and black lighting/fog reveals.
+
+Shared enemies
+--------------
+Deaths are shared for normal enemies, pirate-station guns, and worm bosses.
+Enemy movement, attacks, and partial health are not yet host-authoritative.
+
+Reconnects and teammate locator
+-------------------------------
+Persistent player IDs retain personal cargo, stats, upgrades, gadgets, and last
+position for each host save. The optional locator displays a teammate's name,
+direction, and distance only while their complete ship is off-screen.

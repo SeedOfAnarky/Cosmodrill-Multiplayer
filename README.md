@@ -4,12 +4,9 @@ An experimental cooperative multiplayer mod for Cosmodrill, built with
 [MelonLoader](https://github.com/LavaGang/MelonLoader) and the networking components shipped with
 the game.
 
-Install melon loader and downlaod the zip version from release then drop it into the melon files.
-
-
 ## Features
 
-- Clickable in-game host/join menu with persistent player names.
+- Clickable in-game host/join menu with persistent player names and IDs.
 - Automatic UPnP hosting or manual port configuration.
 - Compact nine-character join codes.
 - Host-directed save bootstrap, scene travel, and loading.
@@ -17,6 +14,11 @@ Install melon loader and downlaod the zip version from release then drop it into
 - Shared drill and gadget-bomb tile removal.
 - Shared tunnel lighting/fog reveals, collision caches, and removed-tile saves.
 - Host-authoritative delivered station resources and spending.
+- Shared deaths for normal enemies, pirate-station guns, and worm bosses.
+- Reconnect restoration for personal cargo, ship stats, upgrades, gadgets, and
+  the last position in that host save.
+- Optional teammate name, direction, and distance locator that appears only
+  while that teammate is off-screen.
 - Connected-player list and detailed traffic/economy/lighting logs.
 
 ## Requirements
@@ -37,8 +39,9 @@ Install melon loader and downlaod the zip version from release then drop it into
 
 ## Hosting a game
 
-1. Load or create the world on the host and wait until the ship can move.
-2. Open **CO-OP** and select **AUTOMATIC HOST**.
+1. Open **CO-OP MULTIPLAYER** and select **AUTOMATIC HOST**. This can be done
+   from the main menu or from inside a loaded world.
+2. Select or create a save normally if the host is still at the main menu.
 3. If UPnP is unavailable, use **MANUAL HOST** and forward:
    - selected port: TCP;
    - selected port + 1: UDP;
@@ -50,19 +53,24 @@ Only share it with players you trust.
 
 ## Joining a game
 
-1. Wait until the host is fully inside the world.
-2. Open **CO-OP MULTIPLAYER** from the main menu.
-3. Enter the nine-character code and select **JOIN WORLD**.
-4. The host's saved-world snapshot and current scene will load automatically.
+1. Open **CO-OP MULTIPLAYER** from the main menu.
+2. Enter the nine-character code and select **JOIN WORLD**.
+3. If the host is still loading a save, the guest remains connected and waits.
+4. The host's saved-world snapshot and current scene load automatically as soon
+   as the host save, player, and tilemaps are ready.
 
 ## Shared and personal state
 
 The host owns the authoritative world and delivered station inventory. Tiles,
 tunnel lighting, removed-tile save data, and station resource totals are shared.
 Ore being carried before delivery remains personal to the player carrying it.
+Personal reconnect profiles are keyed by the persistent player ID, host ID, and
+host save slot; they do not replace the host's tiles, story, map, or station
+ledger.
 
-Enemy AI, combat/health, and every progression interaction are not yet fully
-authoritative. Back up important saves while testing development releases.
+Enemy deaths are shared, but enemy movement, attacks, and partial health are not
+yet fully authoritative. Back up important saves while testing development
+releases.
 
 ## Portable local test copies
 
@@ -79,7 +87,8 @@ The mod will suppress Steam redirection for that copy and store its saves under
 ## Logs
 
 Logs are written under `MelonLoader/Logs`. Useful categories include `STATE`,
-`TRAFFIC`, `ECONOMY`, `LIGHTING`, `BOOTSTRAP`, `SERVER`, and `CLIENT`.
+`TRAFFIC`, `IDENTITY`, `PROFILE`, `RECONNECT`, `ECONOMY`, `LIGHTING`,
+`BOOTSTRAP`, `SERVER`, and `CLIENT`.
 
 ## Building from source
 
