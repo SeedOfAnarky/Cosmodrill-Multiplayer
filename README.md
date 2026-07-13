@@ -4,6 +4,9 @@ An experimental cooperative multiplayer mod for Cosmodrill, built with
 [MelonLoader](https://github.com/LavaGang/MelonLoader) and the networking components shipped with
 the game.
 
+Install melon loader and downlaod the zip version from release then drop it into the melon files.
+
+
 ## Features
 
 - Clickable in-game host/join menu with persistent player names.
