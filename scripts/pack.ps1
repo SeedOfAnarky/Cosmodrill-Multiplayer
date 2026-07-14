@@ -63,7 +63,9 @@ $sourceFiles = @(
     'CosmodrillMultiplayer.csproj',
     'EconomySynchronization.cs',
     'EnemySynchronization.cs',
+    'EnemyPositionSynchronization.cs',
     'JoinCode.cs',
+    'MinedResourceSynchronization.cs',
     'MultiplayerMod.cs',
     'PACKAGE_README.txt',
     'PlayerSessionSynchronization.cs',
@@ -71,8 +73,14 @@ $sourceFiles = @(
     'RELEASE_NOTES.md',
     'RemotePlayerAvatar.cs',
     'ReplicationChannel.cs',
+    'ResourceDropSynchronization.cs',
+    'RescueRewardSynchronization.cs',
+    'SavePathResolver.cs',
+    'SaveWipeMenu.cs',
+    'StationRepairSynchronization.cs',
     'TeammateLocator.cs',
     'THIRD_PARTY_NOTICES.md',
+    'WorldDeviceSynchronization.cs',
     'WorldSynchronization.cs'
 )
 foreach ($file in $sourceFiles)
